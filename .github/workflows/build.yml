@@ -1,0 +1,535 @@
+name: Build FastCam APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Generate Gradle files
+        run: |
+          mkdir -p app/src/main/java/com/fastcam app/src/main/res/values app/src/main/res/drawable app/src/main/res/mipmap-anydpi-v26
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FastCam"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.fastcam"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.fastcam"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              signingConfigs {
+                  create("rel") {
+                      storeFile = file("../fastcam.jks")
+                      storePassword = "fastcam123"
+                      keyAlias = "fastcam"
+                      keyPassword = "fastcam123"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      signingConfig = signingConfigs.getByName("rel")
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+
+          dependencies {
+              implementation("androidx.activity:activity-ktx:1.9.3")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-view:1.3.4")
+          }
+          EOF
+
+          echo "# FastCam" > app/proguard-rules.pro
+
+          keytool -genkeypair -keystore fastcam.jks -alias fastcam -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass fastcam123 -keypass fastcam123 -dname "CN=FastCam"
+
+      - name: Generate resources
+        run: |
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+              <application
+                  android:name=".App"
+                  android:label="FastCam"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="false"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:navigationBarColor">@android:color/black</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="icon_bg">#202020</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#FFFFFF" android:pathData="M30,42h12l4,-6h16l4,6h12v30H30z" />
+              <path android:fillColor="#202020" android:pathData="M44,57a10,10 0 1,0 20,0a10,10 0 1,0 -20,0z" />
+          </vector>
+          EOF
+
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
+          EOF
+
+      - name: Generate Kotlin sources
+        run: |
+          cat > app/src/main/java/com/fastcam/Log2.kt <<'EOF'
+          package com.fastcam
+
+          import android.content.Context
+          import android.os.Process
+          import android.os.SystemClock
+          import android.util.Log
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.Executors
+
+          // Log file: Android/data/com.fastcam/files/fastcam.log
+          object Log2 {
+              private const val TAG = "FastCam"
+              private var file: File? = null
+              private val io = Executors.newSingleThreadExecutor()
+              private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+
+              fun init(c: Context) {
+                  val f = File(c.getExternalFilesDir(null) ?: c.filesDir, "fastcam.log")
+                  file = f
+                  io.execute { try { if (f.length() > 512_000) f.delete() } catch (_: Exception) {} }
+              }
+
+              fun sinceStart(): Long = SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime()
+
+              fun i(m: String) = w(Log.INFO, m)
+
+              fun e(m: String, t: Throwable? = null) =
+                  w(Log.ERROR, m + (if (t != null) " :: " + Log.getStackTraceString(t) else ""))
+
+              private fun w(p: Int, m: String) {
+                  Log.println(p, TAG, m)
+                  val now = System.currentTimeMillis()
+                  io.execute {
+                      try { file?.appendText(fmt.format(Date(now)) + " " + m + "\n") } catch (_: Exception) {}
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/fastcam/App.kt <<'EOF'
+          package com.fastcam
+
+          import android.app.Application
+          import androidx.camera.lifecycle.ProcessCameraProvider
+
+          class App : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  Log2.init(this)
+                  Log2.i("App.onCreate +${Log2.sinceStart()}ms")
+                  // Pre-warm CameraX so the first bind is faster
+                  ProcessCameraProvider.getInstance(this)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/fastcam/MainActivity.kt <<'EOF'
+          package com.fastcam
+
+          import android.Manifest
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.OrientationEventListener
+          import android.view.ScaleGestureDetector
+          import android.view.Surface
+          import android.view.View
+          import android.widget.FrameLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.core.Camera
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.FocusMeteringAction
+          import androidx.camera.core.ImageCapture
+          import androidx.camera.core.ImageCaptureException
+          import androidx.camera.core.Preview
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.view.PreviewView
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var previewView: PreviewView
+              private lateinit var zoomTv: TextView
+              private lateinit var flashTv: TextView
+              private lateinit var orient: OrientationEventListener
+              private var camera: Camera? = null
+              private var imageCapture: ImageCapture? = null
+              private var flashMode = ImageCapture.FLASH_MODE_OFF
+              private var scaled = false
+
+              private val permLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      Log2.i("camera permission granted=$ok")
+                      if (ok) startCamera()
+                      else Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Log2.i("Activity.onCreate +${Log2.sinceStart()}ms")
+                  buildUi()
+
+                  orient = object : OrientationEventListener(this) {
+                      override fun onOrientationChanged(o: Int) {
+                          if (o == ORIENTATION_UNKNOWN) return
+                          imageCapture?.targetRotation = when (o) {
+                              in 45..134 -> Surface.ROTATION_270
+                              in 135..224 -> Surface.ROTATION_180
+                              in 225..314 -> Surface.ROTATION_90
+                              else -> Surface.ROTATION_0
+                          }
+                      }
+                  }
+
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                      startCamera()
+                  } else {
+                      permLauncher.launch(Manifest.permission.CAMERA)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (orient.canDetectOrientation()) orient.enable()
+              }
+
+              override fun onPause() {
+                  orient.disable()
+                  super.onPause()
+              }
+
+              override fun onDestroy() {
+                  Log2.i("Activity.onDestroy")
+                  super.onDestroy()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+              private fun label(t: String) = TextView(this).apply {
+                  text = t
+                  setTextColor(Color.WHITE)
+                  textSize = 18f
+                  setPadding(dp(16), dp(12), dp(16), dp(12))
+              }
+
+              private fun buildUi() {
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(Color.BLACK)
+
+                  previewView = PreviewView(this).apply {
+                      implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+                      scaleType = PreviewView.ScaleType.FIT_CENTER
+                  }
+                  root.addView(previewView, FrameLayout.LayoutParams(-1, -1))
+
+                  // Pinch = zoom, tap = focus
+                  val sgd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScale(d: ScaleGestureDetector): Boolean {
+                          val cam = camera ?: return true
+                          val z = cam.cameraInfo.zoomState.value ?: return true
+                          scaled = true
+                          val r = (z.zoomRatio * d.scaleFactor).coerceIn(z.minZoomRatio, z.maxZoomRatio)
+                          cam.cameraControl.setZoomRatio(r)
+                          return true
+                      }
+                  })
+                  previewView.setOnTouchListener { v, e ->
+                      if (e.actionMasked == MotionEvent.ACTION_DOWN) scaled = false
+                      sgd.onTouchEvent(e)
+                      if (e.actionMasked == MotionEvent.ACTION_UP && !scaled) {
+                          focusAt(e.x, e.y)
+                          v.performClick()
+                      }
+                      true
+                  }
+
+                  val shutter = View(this).apply {
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.WHITE)
+                          setStroke(dp(5), 0xFF666666.toInt())
+                      }
+                      setOnClickListener { shoot() }
+                  }
+                  root.addView(
+                      shutter,
+                      FrameLayout.LayoutParams(dp(76), dp(76), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                          bottomMargin = dp(36)
+                      }
+                  )
+
+                  flashTv = label(flashLabel()).apply { setOnClickListener { cycleFlash() } }
+                  root.addView(
+                      flashTv,
+                      FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
+                          leftMargin = dp(20)
+                          bottomMargin = dp(52)
+                      }
+                  )
+
+                  zoomTv = label("1.0x").apply {
+                      setOnClickListener { camera?.cameraControl?.setZoomRatio(1f) }
+                  }
+                  root.addView(
+                      zoomTv,
+                      FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+                          rightMargin = dp(20)
+                          bottomMargin = dp(52)
+                      }
+                  )
+
+                  setContentView(root)
+              }
+
+              private fun startCamera() {
+                  val fut = ProcessCameraProvider.getInstance(this)
+                  fut.addListener({
+                      try {
+                          val provider = fut.get()
+                          val preview = Preview.Builder().build()
+                          preview.setSurfaceProvider(previewView.surfaceProvider)
+                          val ic = ImageCapture.Builder()
+                              .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                              .setFlashMode(flashMode)
+                              .build()
+
+                          provider.unbindAll()
+                          val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, ic)
+                          camera = cam
+                          imageCapture = ic
+
+                          if (!cam.cameraInfo.hasFlashUnit()) {
+                              flashTv.alpha = 0.3f
+                              flashTv.isEnabled = false
+                          }
+                          cam.cameraInfo.zoomState.observe(this) {
+                              zoomTv.text = String.format(Locale.US, "%.1fx", it.zoomRatio)
+                          }
+                          previewView.previewStreamState.observe(this) { s ->
+                              if (s == PreviewView.StreamState.STREAMING) {
+                                  Log2.i("first frame +${Log2.sinceStart()}ms since process start")
+                              }
+                          }
+                          Log2.i("camera bound +${Log2.sinceStart()}ms flashUnit=${cam.cameraInfo.hasFlashUnit()}")
+                      } catch (e: Exception) {
+                          Log2.e("camera bind failed", e)
+                      }
+                  }, mainExecutor)
+              }
+
+              private fun focusAt(x: Float, y: Float) {
+                  val cam = camera ?: return
+                  val p = previewView.meteringPointFactory.createPoint(x, y)
+                  cam.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(p).build())
+              }
+
+              private fun flashLabel() = when (flashMode) {
+                  ImageCapture.FLASH_MODE_ON -> "⚡ ON"
+                  ImageCapture.FLASH_MODE_AUTO -> "⚡ AUTO"
+                  else -> "⚡ OFF"
+              }
+
+              private fun cycleFlash() {
+                  flashMode = when (flashMode) {
+                      ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
+                      ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
+                      else -> ImageCapture.FLASH_MODE_OFF
+                  }
+                  imageCapture?.flashMode = flashMode
+                  flashTv.text = flashLabel()
+                  Log2.i("flash -> ${flashLabel()}")
+              }
+
+              private fun shoot() {
+                  val ic = imageCapture ?: return
+                  val name = "IMG_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+                  val cv = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                      put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                      put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/FastCam")
+                  }
+                  val opts = ImageCapture.OutputFileOptions
+                      .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                      .build()
+
+                  val zoom = camera?.cameraInfo?.zoomState?.value?.zoomRatio
+                  Log2.i("capture requested name=$name flash=${flashLabel()} zoom=$zoom")
+                  val t0 = SystemClock.elapsedRealtime()
+
+                  previewView.animate().alpha(0.4f).setDuration(40).withEndAction {
+                      previewView.animate().alpha(1f).setDuration(80).start()
+                  }.start()
+
+                  ic.takePicture(opts, mainExecutor, object : ImageCapture.OnImageSavedCallback {
+                      override fun onImageSaved(r: ImageCapture.OutputFileResults) {
+                          Log2.i("saved ${r.savedUri} in ${SystemClock.elapsedRealtime() - t0}ms")
+                      }
+
+                      override fun onError(e: ImageCaptureException) {
+                          Log2.e("capture failed code=${e.imageCaptureError}", e)
+                          Toast.makeText(this@MainActivity, "Capture failed", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/release/app-release.apk FastCam.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FastCam
+          path: FastCam.apk
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" FastCam.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "FastCam build ${{ github.run_number }}" \
+            --notes "Direct APK download"
