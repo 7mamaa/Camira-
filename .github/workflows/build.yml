@@ -56,7 +56,6 @@ jobs:
 
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx3g
-          android.useAndroidX=true
           kotlin.code.style=official
           EOF
 
@@ -74,8 +73,8 @@ jobs:
                   applicationId = "com.fastcam"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "2.0"
               }
 
               signingConfigs {
@@ -107,14 +106,6 @@ jobs:
                   abortOnError = false
               }
           }
-
-          dependencies {
-              implementation("androidx.activity:activity-ktx:1.9.3")
-              implementation("androidx.camera:camera-core:1.3.4")
-              implementation("androidx.camera:camera-camera2:1.3.4")
-              implementation("androidx.camera:camera-lifecycle:1.3.4")
-              implementation("androidx.camera:camera-view:1.3.4")
-          }
           EOF
 
           echo "# FastCam" > app/proguard-rules.pro
@@ -130,18 +121,22 @@ jobs:
 
               <uses-permission android:name="android.permission.CAMERA" />
               <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+              <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
               <application
                   android:name=".App"
                   android:label="FastCam"
                   android:icon="@mipmap/ic_launcher"
                   android:allowBackup="false"
+                  android:hardwareAccelerated="true"
                   android:theme="@style/AppTheme">
 
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
-                      android:screenOrientation="portrait">
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -199,37 +194,81 @@ jobs:
           import android.os.SystemClock
           import android.util.Log
           import java.io.File
-          import java.text.SimpleDateFormat
-          import java.util.Date
+          import java.io.FileOutputStream
+          import java.time.Instant
+          import java.time.ZoneId
+          import java.time.format.DateTimeFormatter
+          import java.util.ArrayDeque
           import java.util.Locale
           import java.util.concurrent.Executors
 
-          // Log file: Android/data/com.fastcam/files/fastcam.log
+          // Timing/diagnostic log only: Android/data/com.fastcam/files/fastcam.log
           object Log2 {
               private const val TAG = "FastCam"
-              private var file: File? = null
               private val io = Executors.newSingleThreadExecutor()
-              private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-
-              fun init(c: Context) {
-                  val f = File(c.getExternalFilesDir(null) ?: c.filesDir, "fastcam.log")
-                  file = f
-                  io.execute { try { if (f.length() > 512_000) f.delete() } catch (_: Exception) {} }
-              }
+              private val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+              private val lock = Any()
+              private val buffer = ArrayDeque<Pair<Long, String>>(64)
+              @Volatile private var diskEnabled = false
+              private var logFile: File? = null
 
               fun sinceStart(): Long = SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime()
 
-              fun i(m: String) = w(Log.INFO, m)
+              fun enableDisk(context: Context) {
+                  val appCtx = context.applicationContext
+                  synchronized(lock) {
+                      if (diskEnabled) return
+                      diskEnabled = true
+                  }
+                  io.execute {
+                      try {
+                          val f = File(appCtx.getExternalFilesDir(null) ?: appCtx.filesDir, "fastcam.log")
+                          if (f.exists() && f.length() > 512_000) f.delete()
+                          logFile = f
+                          flushBuffered(f)
+                      } catch (_: Throwable) {}
+                  }
+              }
+
+              fun i(m: String) = record(Log.INFO, m)
 
               fun e(m: String, t: Throwable? = null) =
-                  w(Log.ERROR, m + (if (t != null) " :: " + Log.getStackTraceString(t) else ""))
+                  record(Log.ERROR, m + if (t != null) " :: ${t.javaClass.simpleName}: ${t.message}" else "")
 
-              private fun w(p: Int, m: String) {
-                  Log.println(p, TAG, m)
+              private fun record(priority: Int, m: String) {
+                  Log.println(priority, TAG, m)
                   val now = System.currentTimeMillis()
-                  io.execute {
-                      try { file?.appendText(fmt.format(Date(now)) + " " + m + "\n") } catch (_: Exception) {}
+                  val ready: Boolean
+                  synchronized(lock) {
+                      if (buffer.size >= 200) buffer.pollFirst()
+                      buffer.addLast(now to m)
+                      ready = diskEnabled
                   }
+                  if (ready) {
+                      io.execute {
+                          val f = logFile ?: return@execute
+                          flushBuffered(f)
+                      }
+                  }
+              }
+
+              private fun flushBuffered(f: File) {
+                  val batch = ArrayList<Pair<Long, String>>()
+                  synchronized(lock) {
+                      while (buffer.isNotEmpty()) batch.add(buffer.removeFirst())
+                  }
+                  if (batch.isEmpty()) return
+                  try {
+                      val sb = StringBuilder(batch.size * 64)
+                      val zone = ZoneId.systemDefault()
+                      for ((ts, msg) in batch) {
+                          sb.append(fmt.format(Instant.ofEpochMilli(ts).atZone(zone)))
+                              .append(' ')
+                              .append(msg)
+                              .append('\n')
+                      }
+                      FileOutputStream(f, true).use { it.write(sb.toString().toByteArray(Charsets.UTF_8)) }
+                  } catch (_: Throwable) {}
               }
           }
           EOF
@@ -238,15 +277,1067 @@ jobs:
           package com.fastcam
 
           import android.app.Application
-          import androidx.camera.lifecycle.ProcessCameraProvider
 
           class App : Application() {
               override fun onCreate() {
                   super.onCreate()
-                  Log2.init(this)
+                  // Keep Application.onCreate completely free of camera/disk I/O
                   Log2.i("App.onCreate +${Log2.sinceStart()}ms")
-                  // Pre-warm CameraX so the first bind is faster
-                  ProcessCameraProvider.getInstance(this)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/fastcam/CameraEngine.kt <<'EOF'
+          package com.fastcam
+
+          import android.Manifest
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.ImageFormat
+          import android.graphics.Matrix
+          import android.graphics.Rect
+          import android.hardware.camera2.CameraCaptureSession
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraDevice
+          import android.hardware.camera2.CameraManager
+          import android.hardware.camera2.CameraMetadata
+          import android.hardware.camera2.CaptureFailure
+          import android.hardware.camera2.CaptureRequest
+          import android.hardware.camera2.CaptureResult
+          import android.hardware.camera2.TotalCaptureResult
+          import android.hardware.camera2.params.MeteringRectangle
+          import android.hardware.camera2.params.OutputConfiguration
+          import android.hardware.camera2.params.SessionConfiguration
+          import android.media.ExifInterface
+          import android.media.Image
+          import android.media.ImageReader
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.Looper
+          import android.os.Process
+          import android.os.SystemClock
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.view.Surface
+          import android.view.SurfaceHolder
+          import java.io.ByteArrayInputStream
+          import java.time.LocalDateTime
+          import java.time.format.DateTimeFormatter
+          import java.util.ArrayDeque
+          import java.util.Locale
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.Executor
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicInteger
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class CameraEngine(
+              context: Context,
+              private val listener: Listener
+          ) {
+              interface Listener {
+                  fun onPreviewSizeReady(gen: Int, width: Int, height: Int, sensorOrientation: Int)
+                  fun onCameraReady(facing: Int, hasFlash: Boolean, minZoom: Float, maxZoom: Float)
+                  fun onSwitchAvailability(canSwitch: Boolean)
+                  fun onFirstFrame()
+                  fun onShutterTriggered()
+                  fun onZoomChanged(zoom: Float)
+                  fun onThumbReady(bitmap: Bitmap)
+                  fun onPhotoSaved(uri: Uri)
+                  fun onError(msg: String)
+              }
+
+              companion object {
+                  const val FLASH_OFF = 0
+                  const val FLASH_ON = 1
+                  const val FLASH_AUTO = 2
+
+                  private const val STATE_PREVIEW = 0
+                  private const val STATE_WAITING_LOCK = 1
+                  private const val STATE_WAITING_PRECAPTURE = 2
+                  private const val STATE_WAITING_NON_PRECAPTURE = 3
+
+                  private const val MAX_IMAGES = 4
+                  private const val MAX_IN_FLIGHT = 3
+                  private const val MAX_JPEG_PIXELS = 16_500_000L
+                  private const val PREFS_NAME = "fc_cam_cache"
+                  private val NAME_FMT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS", Locale.US)
+              }
+
+              private data class CamMeta(
+                  val id: String,
+                  val facing: Int,
+                  val fromCache: Boolean,
+                  val sensorOrientation: Int,
+                  val hasFlash: Boolean,
+                  val activeArray: Rect,
+                  val minZoom: Float,
+                  val maxZoom: Float,
+                  val useZoomRatioApi: Boolean,
+                  val hasAutoFocus: Boolean,
+                  val hasContinuousAf: Boolean,
+                  val hasAutoAf: Boolean,
+                  val supportsAeAlwaysFlash: Boolean,
+                  val supportsAeAutoFlash: Boolean,
+                  val supportsFastEdge: Boolean,
+                  val supportsFastNr: Boolean,
+                  val maxRegionsAf: Int,
+                  val maxRegionsAe: Int,
+                  val isLegacy: Boolean,
+                  val previewSize: Size,
+                  val jpegSize: Size
+              )
+
+              private data class ShotMeta(val t0: Long)
+
+              private val appCtx = context.applicationContext
+              private val manager = appCtx.getSystemService(CameraManager::class.java)
+              private val camThread = HandlerThread("FastCam-Cam", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
+              private val camHandler = Handler(camThread.looper)
+              private val camExecutor = Executor { camHandler.post(it) }
+              private val ioExecutor = Executors.newSingleThreadExecutor()
+              private val mainHandler = Handler(Looper.getMainLooper())
+
+              private val openGen = AtomicInteger(0)
+              private val inFlightCaptures = AtomicInteger(0)
+              @Volatile private var active = false
+              @Volatile private var deviceOrientationDeg = 0
+              @Volatile var currentFacing = CameraCharacteristics.LENS_FACING_BACK
+                  private set
+              @Volatile var flashMode = FLASH_OFF
+                  private set
+              @Volatile var currentZoom = 1f
+                  private set
+
+              // Confined strictly to camHandler
+              private val metaCache = HashMap<Int, CamMeta>(2)
+              private val pendingShots = ArrayDeque<ShotMeta>(MAX_IMAGES)
+              private var activeMeta: CamMeta? = null
+              private var cameraDevice: CameraDevice? = null
+              private var captureSession: CameraCaptureSession? = null
+              private var imageReader: ImageReader? = null
+              private var previewSurface: Surface? = null
+              private var surfaceGen = -1
+              private var previewBuilder: CaptureRequest.Builder? = null
+              private var displayW = 1080
+              private var displayH = 1920
+              private var firstFrameSeen = false
+              private var switchChecked = false
+              private var capState = STATE_PREVIEW
+              private var lastAfState: Int? = null
+              private var lastAeState: Int? = null
+              private var pendingShotTime = 0L
+              private var pendingJpegOrient = 90
+              private var pendingNeedsFlash = false
+              private var customAfRegions: Array<MeteringRectangle>? = null
+              private var customAeRegions: Array<MeteringRectangle>? = null
+
+              private val precaptureTimeout = Runnable {
+                  if (capState != STATE_PREVIEW) {
+                      Log2.i("precapture timeout -> capture")
+                      capState = STATE_PREVIEW
+                      captureStillPicture(pendingShotTime, pendingJpegOrient, unlockAfter = true)
+                  }
+              }
+
+              private val resetFocusRunnable = Runnable {
+                  if (capState != STATE_PREVIEW) return@Runnable
+                  customAfRegions = null
+                  customAeRegions = null
+                  updatePreviewRepeating()
+              }
+
+              fun start(facing: Int, dispW: Int, dispH: Int): Int {
+                  currentFacing = facing
+                  active = true
+                  val gen = openGen.incrementAndGet()
+                  camHandler.post {
+                      displayW = max(1, dispW)
+                      displayH = max(1, dispH)
+                      openForFacing(gen, facing, allowFallback = true)
+                  }
+                  return gen
+              }
+
+              fun switchCamera(): Int {
+                  val nextFacing = if (currentFacing == CameraCharacteristics.LENS_FACING_BACK) {
+                      CameraCharacteristics.LENS_FACING_FRONT
+                  } else {
+                      CameraCharacteristics.LENS_FACING_BACK
+                  }
+                  Log2.i("switch camera -> facing=$nextFacing")
+                  currentFacing = nextFacing
+                  currentZoom = 1f
+                  active = true
+                  val gen = openGen.incrementAndGet()
+                  camHandler.post {
+                      closeCameraInternal()
+                      openForFacing(gen, nextFacing, allowFallback = true)
+                  }
+                  return gen
+              }
+
+              fun onSurfaceReady(gen: Int, surface: Surface) {
+                  camHandler.post {
+                      if (!active || gen != openGen.get()) return@post
+                      previewSurface = surface
+                      surfaceGen = gen
+                      tryCreateSession(gen)
+                  }
+              }
+
+              fun onSurfaceDestroyed() {
+                  camHandler.post {
+                      previewSurface = null
+                      surfaceGen = -1
+                      closeSessionInternal()
+                  }
+              }
+
+              fun stop() {
+                  active = false
+                  openGen.incrementAndGet()
+                  val latch = CountDownLatch(1)
+                  camHandler.post {
+                      closeCameraInternal()
+                      latch.countDown()
+                  }
+                  try {
+                      latch.await(400, TimeUnit.MILLISECONDS)
+                  } catch (_: InterruptedException) {}
+              }
+
+              fun destroy() {
+                  stop()
+                  camThread.quitSafely()
+                  ioExecutor.shutdown()
+              }
+
+              fun setDeviceOrientation(deg: Int) {
+                  deviceOrientationDeg = deg
+              }
+
+              fun cycleFlash(): Int {
+                  val next = when (flashMode) {
+                      FLASH_OFF -> FLASH_ON
+                      FLASH_ON -> FLASH_AUTO
+                      else -> FLASH_OFF
+                  }
+                  flashMode = next
+                  camHandler.post { updatePreviewRepeating() }
+                  return next
+              }
+
+              fun scaleZoom(scaleFactor: Float) {
+                  camHandler.post {
+                      val meta = activeMeta ?: return@post
+                      val nz = (currentZoom * scaleFactor).coerceIn(meta.minZoom, meta.maxZoom)
+                      if (abs(nz - currentZoom) < 0.01f) return@post
+                      currentZoom = nz
+                      updatePreviewRepeating()
+                      mainHandler.post { listener.onZoomChanged(nz) }
+                  }
+              }
+
+              fun resetZoom() {
+                  camHandler.post {
+                      val meta = activeMeta ?: return@post
+                      val target = 1f.coerceIn(meta.minZoom, meta.maxZoom)
+                      currentZoom = target
+                      updatePreviewRepeating()
+                      mainHandler.post { listener.onZoomChanged(target) }
+                  }
+              }
+
+              fun focusAt(x: Float, y: Float, viewW: Int, viewH: Int) {
+                  if (viewW <= 0 || viewH <= 0) return
+                  camHandler.post {
+                      val cam = cameraDevice ?: return@post
+                      val session = captureSession ?: return@post
+                      val meta = activeMeta ?: return@post
+                      if (capState != STATE_PREVIEW) return@post
+                      if (!meta.hasAutoFocus && meta.maxRegionsAe <= 0) return@post
+
+                      val nx = (x / viewW.toFloat()).coerceIn(0f, 1f)
+                      val ny = (y / viewH.toFloat()).coerceIn(0f, 1f)
+                      val isFront = meta.facing == CameraCharacteristics.LENS_FACING_FRONT
+
+                      val sx: Float
+                      val sy: Float
+                      when (meta.sensorOrientation) {
+                          90 -> {
+                              sx = ny
+                              sy = if (isFront) nx else 1f - nx
+                          }
+                          270 -> {
+                              sx = 1f - ny
+                              sy = if (isFront) 1f - nx else nx
+                          }
+                          180 -> {
+                              sx = if (isFront) nx else 1f - nx
+                              sy = 1f - ny
+                          }
+                          else -> {
+                              sx = if (isFront) 1f - nx else nx
+                              sy = ny
+                          }
+                      }
+
+                      val visible = currentVisibleCropRect(meta)
+                      val cx = (visible.left + sx * visible.width()).toInt()
+                      val cy = (visible.top + sy * visible.height()).toInt()
+                      val halfW = max(1, (visible.width() * 0.08f).toInt())
+                      val halfH = max(1, (visible.height() * 0.08f).toInt())
+                      val rect = Rect(
+                          (cx - halfW).coerceIn(meta.activeArray.left, meta.activeArray.right - 1),
+                          (cy - halfH).coerceIn(meta.activeArray.top, meta.activeArray.bottom - 1),
+                          (cx + halfW).coerceIn(meta.activeArray.left + 1, meta.activeArray.right),
+                          (cy + halfH).coerceIn(meta.activeArray.top + 1, meta.activeArray.bottom)
+                      )
+                      if (rect.width() <= 0 || rect.height() <= 0) return@post
+
+                      val mr = arrayOf(MeteringRectangle(rect, 800))
+                      customAfRegions = if (meta.maxRegionsAf > 0) mr else null
+                      customAeRegions = if (meta.maxRegionsAe > 0) mr else null
+
+                      try {
+                          val pb = previewBuilder ?: return@post
+                          applyPreviewParams(pb, meta)
+                          if (meta.hasAutoAf) pb.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                          pb.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                          session.setRepeatingRequest(pb.build(), previewCallback, camHandler)
+
+                          if (meta.hasAutoFocus) {
+                              val trig = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                              previewSurface?.let { trig.addTarget(it) }
+                              applyPreviewParams(trig, meta)
+                              if (meta.hasAutoAf) trig.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                              trig.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                              session.capture(trig.build(), previewCallback, camHandler)
+                          }
+                          camHandler.removeCallbacks(resetFocusRunnable)
+                          camHandler.postDelayed(resetFocusRunnable, 3000L)
+                      } catch (e: Throwable) {
+                          Log2.e("focusAt failed", e)
+                      }
+                  }
+              }
+
+              fun takePhoto() {
+                  val t0 = SystemClock.elapsedRealtime()
+                  camHandler.post {
+                      val meta = activeMeta ?: return@post
+                      if (cameraDevice == null || captureSession == null || imageReader == null) return@post
+                      if (capState != STATE_PREVIEW) return@post
+                      if (inFlightCaptures.get() >= MAX_IN_FLIGHT) {
+                          Log2.i("capture dropped: queue full")
+                          return@post
+                      }
+
+                      val jpegOrient = computeJpegOrientation(meta, deviceOrientationDeg)
+                      val needsFlash = meta.hasFlash && (
+                          flashMode == FLASH_ON ||
+                              (flashMode == FLASH_AUTO && lastAeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED)
+                          )
+
+                      val afReady = !meta.hasAutoFocus ||
+                          lastAfState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                          lastAfState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+                      val aeReady = !needsFlash && (
+                          lastAeState == null ||
+                              lastAeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                              lastAeState == CaptureResult.CONTROL_AE_STATE_LOCKED
+                          )
+
+                      Log2.i("capture requested facing=${meta.facing} flash=$flashMode zoom=$currentZoom af=$lastAfState ae=$lastAeState fast=${afReady && aeReady}")
+
+                      if (afReady && aeReady) {
+                          captureStillPicture(t0, jpegOrient, unlockAfter = false)
+                      } else {
+                          pendingShotTime = t0
+                          pendingJpegOrient = jpegOrient
+                          pendingNeedsFlash = needsFlash
+                          startPrecapture(meta, afReady, needsFlash)
+                      }
+                  }
+              }
+
+              // ---- Camera open & caching (strictly on camHandler) ----
+
+              private fun openForFacing(gen: Int, facing: Int, allowFallback: Boolean) {
+                  if (!active || gen != openGen.get()) return
+                  if (appCtx.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                      Log2.i("open skipped: no CAMERA permission")
+                      return
+                  }
+
+                  val meta = resolveMeta(facing, allowFallback)
+                  if (meta == null) {
+                      Log2.e("no camera found for facing=$facing")
+                      mainHandler.post { listener.onError("No camera available") }
+                      return
+                  }
+
+                  activeMeta = meta
+                  currentFacing = meta.facing
+                  currentZoom = 1f.coerceIn(meta.minZoom, meta.maxZoom)
+                  customAfRegions = null
+                  customAeRegions = null
+                  lastAfState = null
+                  lastAeState = null
+                  capState = STATE_PREVIEW
+
+                  mainHandler.post {
+                      listener.onPreviewSizeReady(gen, meta.previewSize.width, meta.previewSize.height, meta.sensorOrientation)
+                      listener.onCameraReady(meta.facing, meta.hasFlash, meta.minZoom, meta.maxZoom)
+                  }
+
+                  try {
+                      imageReader?.close()
+                      imageReader = ImageReader.newInstance(
+                          meta.jpegSize.width,
+                          meta.jpegSize.height,
+                          ImageFormat.JPEG,
+                          MAX_IMAGES
+                      ).apply {
+                          setOnImageAvailableListener(::onImageAvailable, camHandler)
+                      }
+                  } catch (e: Throwable) {
+                      Log2.e("ImageReader init failed", e)
+                      mainHandler.post { listener.onError("ImageReader failed") }
+                      return
+                  }
+
+                  try {
+                      Log2.i("openCamera id=${meta.id} cached=${meta.fromCache} +${Log2.sinceStart()}ms")
+                      manager.openCamera(meta.id, camExecutor, object : CameraDevice.StateCallback() {
+                          override fun onOpened(camera: CameraDevice) {
+                              if (!active || gen != openGen.get()) {
+                                  try { camera.close() } catch (_: Throwable) {}
+                                  return
+                              }
+                              cameraDevice = camera
+                              Log2.i("camera opened id=${meta.id} +${Log2.sinceStart()}ms")
+                              tryCreateSession(gen)
+                          }
+
+                          override fun onDisconnected(camera: CameraDevice) {
+                              Log2.i("camera disconnected id=${meta.id}")
+                              if (cameraDevice === camera) {
+                                  closeCameraInternal()
+                              } else {
+                                  try { camera.close() } catch (_: Throwable) {}
+                              }
+                          }
+
+                          override fun onError(camera: CameraDevice, error: Int) {
+                              Log2.e("camera error id=${meta.id} code=$error")
+                              if (cameraDevice === camera) {
+                                  closeCameraInternal()
+                              } else {
+                                  try { camera.close() } catch (_: Throwable) {}
+                              }
+                              if (meta.fromCache && allowFallback && active && gen == openGen.get()) {
+                                  invalidateCachedId(facing)
+                                  openForFacing(gen, facing, allowFallback = false)
+                              } else if (active && gen == openGen.get()) {
+                                  mainHandler.post { listener.onError("Camera error ($error)") }
+                              }
+                          }
+                      })
+                  } catch (e: Throwable) {
+                      Log2.e("openCamera threw id=${meta.id}", e)
+                      if (meta.fromCache && allowFallback) {
+                          invalidateCachedId(facing)
+                          openForFacing(gen, facing, allowFallback = false)
+                      } else {
+                          mainHandler.post { listener.onError("Cannot open camera") }
+                      }
+                  }
+              }
+
+              private fun resolveMeta(facing: Int, allowFallback: Boolean): CamMeta? {
+                  metaCache[facing]?.let { return it }
+
+                  val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                  val cachedId = prefs.getString("id_$facing", null)
+                  if (cachedId != null) {
+                      val loaded = try { loadMeta(cachedId, facing, fromCache = true) } catch (_: Throwable) { null }
+                      if (loaded != null) {
+                          metaCache[facing] = loaded
+                          return loaded
+                      }
+                      prefs.edit().remove("id_$facing").apply()
+                  }
+
+                  val ids = try { manager.cameraIdList } catch (e: Throwable) {
+                      Log2.e("cameraIdList failed", e)
+                      return null
+                  }
+                  var matchedId: String? = null
+                  for (id in ids) {
+                      try {
+                          val ch = manager.getCameraCharacteristics(id)
+                          if (ch.get(CameraCharacteristics.LENS_FACING) == facing) {
+                              matchedId = id
+                              break
+                          }
+                      } catch (_: Throwable) {}
+                  }
+                  if (matchedId == null && allowFallback) {
+                      matchedId = ids.firstOrNull()
+                  }
+                  val chosenId = matchedId ?: return null
+                  val loaded = try { loadMeta(chosenId, null, fromCache = false) } catch (e: Throwable) {
+                      Log2.e("loadMeta failed id=$chosenId", e)
+                      return null
+                  } ?: return null
+
+                  prefs.edit().putString("id_${loaded.facing}", loaded.id).apply()
+                  metaCache[loaded.facing] = loaded
+                  return loaded
+              }
+
+              private fun invalidateCachedId(facing: Int) {
+                  metaCache.remove(facing)
+                  appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .edit().remove("id_$facing").apply()
+              }
+
+              private fun loadMeta(id: String, expectedFacing: Int?, fromCache: Boolean): CamMeta? {
+                  val ch = manager.getCameraCharacteristics(id)
+                  val facing = ch.get(CameraCharacteristics.LENS_FACING) ?: return null
+                  if (expectedFacing != null && facing != expectedFacing) return null
+
+                  val sensorOrientation = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                  val hasFlash = ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                  val activeArray = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                      ?: Rect(0, 0, 4000, 3000)
+
+                  val minZoom: Float
+                  val maxZoom: Float
+                  val useZoomRatioApi: Boolean
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      val zr = ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                      if (zr != null) {
+                          minZoom = zr.lower
+                          maxZoom = zr.upper
+                          useZoomRatioApi = true
+                      } else {
+                          minZoom = 1f
+                          maxZoom = max(1f, ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f)
+                          useZoomRatioApi = false
+                      }
+                  } else {
+                      minZoom = 1f
+                      maxZoom = max(1f, ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f)
+                      useZoomRatioApi = false
+                  }
+
+                  val afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
+                  val hasContinuousAf = afModes.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                  val hasAutoAf = afModes.contains(CameraMetadata.CONTROL_AF_MODE_AUTO)
+                  val minFocusDist = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+                  val hasAutoFocus = (hasContinuousAf || hasAutoAf) && (minFocusDist == null || minFocusDist > 0f)
+
+                  val aeModes = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES) ?: IntArray(0)
+                  val supportsAeAlwaysFlash = aeModes.contains(CameraMetadata.CONTROL_AE_MODE_ON_ALWAYS_FLASH)
+                  val supportsAeAutoFlash = aeModes.contains(CameraMetadata.CONTROL_AE_MODE_ON_AUTO_FLASH)
+
+                  val edgeModes = ch.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: IntArray(0)
+                  val supportsFastEdge = edgeModes.contains(CameraMetadata.EDGE_MODE_FAST)
+
+                  val nrModes = ch.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
+                  val supportsFastNr = nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_FAST)
+
+                  val maxRegionsAf = ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+                  val maxRegionsAe = ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+                  val hwLevel = ch.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+                      ?: CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY
+                  val isLegacy = hwLevel == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY
+
+                  val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+                  val jpegSizes = map.getOutputSizes(ImageFormat.JPEG) ?: return null
+                  val previewSizes = map.getOutputSizes(SurfaceHolder::class.java) ?: return null
+                  if (jpegSizes.isEmpty() || previewSizes.isEmpty()) return null
+
+                  val jpegSize = chooseJpegSize(jpegSizes)
+                  val targetAspect = jpegSize.width.toFloat() / jpegSize.height.toFloat()
+                  val previewSize = choosePreviewSize(previewSizes, targetAspect)
+
+                  return CamMeta(
+                      id = id,
+                      facing = facing,
+                      fromCache = fromCache,
+                      sensorOrientation = sensorOrientation,
+                      hasFlash = hasFlash,
+                      activeArray = activeArray,
+                      minZoom = minZoom,
+                      maxZoom = maxZoom,
+                      useZoomRatioApi = useZoomRatioApi,
+                      hasAutoFocus = hasAutoFocus,
+                      hasContinuousAf = hasContinuousAf,
+                      hasAutoAf = hasAutoAf,
+                      supportsAeAlwaysFlash = supportsAeAlwaysFlash,
+                      supportsAeAutoFlash = supportsAeAutoFlash,
+                      supportsFastEdge = supportsFastEdge,
+                      supportsFastNr = supportsFastNr,
+                      maxRegionsAf = maxRegionsAf,
+                      maxRegionsAe = maxRegionsAe,
+                      isLegacy = isLegacy,
+                      previewSize = previewSize,
+                      jpegSize = jpegSize
+                  )
+              }
+
+              private fun chooseJpegSize(sizes: Array<Size>): Size {
+                  val bounded = sizes.filter { it.width.toLong() * it.height.toLong() <= MAX_JPEG_PIXELS }
+                  val pool = if (bounded.isNotEmpty()) bounded else sizes.toList()
+                  val fourThree = pool.filter { abs(it.width.toFloat() / it.height.toFloat() - 4f / 3f) < 0.08f }
+                  val preferred = if (fourThree.isNotEmpty()) fourThree else pool
+                  return preferred.maxBy { it.width.toLong() * it.height.toLong() }
+              }
+
+              private fun choosePreviewSize(sizes: Array<Size>, targetAspect: Float): Size {
+                  val longCap = min(1920, max(displayW, displayH))
+                  val shortCap = min(1440, min(displayW, displayH))
+
+                  val aspectMatched = sizes.filter {
+                      abs(it.width.toFloat() / it.height.toFloat() - targetAspect) < 0.05f
+                  }
+                  val pool = if (aspectMatched.isNotEmpty()) {
+                      aspectMatched
+                  } else {
+                      val bestDiff = sizes.minOf { abs(it.width.toFloat() / it.height.toFloat() - targetAspect) }
+                      sizes.filter { abs(it.width.toFloat() / it.height.toFloat() - targetAspect) <= bestDiff + 0.02f }
+                  }
+
+                  val withinCap = pool.filter {
+                      max(it.width, it.height) <= longCap && min(it.width, it.height) <= shortCap
+                  }
+                  return if (withinCap.isNotEmpty()) {
+                      withinCap.maxBy { it.width.toLong() * it.height.toLong() }
+                  } else {
+                      pool.minBy { it.width.toLong() * it.height.toLong() }
+                  }
+              }
+
+              private fun checkSwitchAvailability() {
+                  try {
+                      val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      val ed = prefs.edit()
+                      var hasBack = false
+                      var hasFront = false
+                      for (id in manager.cameraIdList) {
+                          val facing = try {
+                              manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)
+                          } catch (_: Throwable) { null }
+                          if (facing == CameraCharacteristics.LENS_FACING_BACK && !hasBack) {
+                              hasBack = true
+                              if (!prefs.contains("id_$facing")) ed.putString("id_$facing", id)
+                          } else if (facing == CameraCharacteristics.LENS_FACING_FRONT && !hasFront) {
+                              hasFront = true
+                              if (!prefs.contains("id_$facing")) ed.putString("id_$facing", id)
+                          }
+                      }
+                      ed.apply()
+                      val canSwitch = hasBack && hasFront
+                      mainHandler.post { listener.onSwitchAvailability(canSwitch) }
+                  } catch (_: Throwable) {}
+              }
+
+              // ---- Session & repeating preview ----
+
+              private fun tryCreateSession(gen: Int) {
+                  val cam = cameraDevice ?: return
+                  val surf = previewSurface ?: return
+                  val reader = imageReader ?: return
+                  if (!active || gen != openGen.get() || surfaceGen != gen) return
+                  if (!surf.isValid) return
+
+                  closeSessionInternal()
+                  try {
+                      val outputs = listOf(OutputConfiguration(surf), OutputConfiguration(reader.surface))
+                      val cfg = SessionConfiguration(
+                          SessionConfiguration.SESSION_REGULAR,
+                          outputs,
+                          camExecutor,
+                          object : CameraCaptureSession.StateCallback() {
+                              override fun onConfigured(session: CameraCaptureSession) {
+                                  if (!active || gen != openGen.get() || cameraDevice !== cam) {
+                                      try { session.close() } catch (_: Throwable) {}
+                                      return
+                                  }
+                                  captureSession = session
+                                  startRepeatingPreview(cam, session, surf)
+                              }
+
+                              override fun onConfigureFailed(session: CameraCaptureSession) {
+                                  Log2.e("session configure failed")
+                                  mainHandler.post { listener.onError("Preview failed") }
+                              }
+                          }
+                      )
+                      cam.createCaptureSession(cfg)
+                  } catch (e: Throwable) {
+                      Log2.e("createCaptureSession failed", e)
+                  }
+              }
+
+              private fun startRepeatingPreview(cam: CameraDevice, session: CameraCaptureSession, surf: Surface) {
+                  val meta = activeMeta ?: return
+                  try {
+                      val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                      b.addTarget(surf)
+                      applyPreviewParams(b, meta)
+                      previewBuilder = b
+                      session.setRepeatingRequest(b.build(), previewCallback, camHandler)
+                      Log2.i("repeating preview started +${Log2.sinceStart()}ms")
+                  } catch (e: Throwable) {
+                      Log2.e("startRepeatingPreview failed", e)
+                  }
+              }
+
+              private fun applyPreviewParams(b: CaptureRequest.Builder, meta: CamMeta) {
+                  b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                  if (meta.hasContinuousAf) {
+                      b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                  } else if (meta.hasAutoAf) {
+                      b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                  }
+                  applyAeFlash(b, meta)
+                  applyZoom(b, meta)
+                  customAfRegions?.let { b.set(CaptureRequest.CONTROL_AF_REGIONS, it) }
+                  customAeRegions?.let { b.set(CaptureRequest.CONTROL_AE_REGIONS, it) }
+              }
+
+              private fun applyAeFlash(b: CaptureRequest.Builder, meta: CamMeta) {
+                  if (!meta.hasFlash) {
+                      b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                      return
+                  }
+                  when (flashMode) {
+                      FLASH_ON -> {
+                          if (meta.supportsAeAlwaysFlash) {
+                              b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON_ALWAYS_FLASH)
+                          } else {
+                              b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                              b.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_SINGLE)
+                          }
+                      }
+                      FLASH_AUTO -> {
+                          if (meta.supportsAeAutoFlash) {
+                              b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON_AUTO_FLASH)
+                          } else {
+                              b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                          }
+                      }
+                      else -> {
+                          b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                          b.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+                      }
+                  }
+              }
+
+              private fun applyZoom(b: CaptureRequest.Builder, meta: CamMeta) {
+                  if (meta.useZoomRatioApi && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      b.set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoom)
+                  } else {
+                      b.set(CaptureRequest.SCALER_CROP_REGION, currentVisibleCropRect(meta))
+                  }
+              }
+
+              private fun currentVisibleCropRect(meta: CamMeta): Rect {
+                  val z = max(1f, currentZoom)
+                  if (z <= 1.001f) return meta.activeArray
+                  val w = meta.activeArray.width()
+                  val h = meta.activeArray.height()
+                  val cw = (w / z).toInt().coerceAtLeast(1)
+                  val ch = (h / z).toInt().coerceAtLeast(1)
+                  val left = meta.activeArray.left + (w - cw) / 2
+                  val top = meta.activeArray.top + (h - ch) / 2
+                  return Rect(left, top, left + cw, top + ch)
+              }
+
+              private fun updatePreviewRepeating() {
+                  val session = captureSession ?: return
+                  val b = previewBuilder ?: return
+                  val meta = activeMeta ?: return
+                  if (capState != STATE_PREVIEW) return
+                  try {
+                      applyPreviewParams(b, meta)
+                      session.setRepeatingRequest(b.build(), previewCallback, camHandler)
+                  } catch (_: Throwable) {}
+              }
+
+              private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
+                  private fun process(result: CaptureResult) {
+                      lastAfState = result.get(CaptureResult.CONTROL_AF_STATE)
+                      lastAeState = result.get(CaptureResult.CONTROL_AE_STATE)
+
+                      if (!firstFrameSeen) {
+                          firstFrameSeen = true
+                          Log2.i("first frame +${Log2.sinceStart()}ms since process start")
+                          mainHandler.post { listener.onFirstFrame() }
+                          if (!switchChecked) {
+                              switchChecked = true
+                              camHandler.post { checkSwitchAvailability() }
+                          }
+                      }
+
+                      when (capState) {
+                          STATE_WAITING_LOCK -> {
+                              val af = lastAfState
+                              val ae = lastAeState
+                              val afDone = af == null ||
+                                  af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                                  af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
+                                  af == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+                              if (afDone) {
+                                  if (!pendingNeedsFlash && (ae == null || ae == CaptureResult.CONTROL_AE_STATE_CONVERGED)) {
+                                      capState = STATE_PREVIEW
+                                      camHandler.removeCallbacks(precaptureTimeout)
+                                      captureStillPicture(pendingShotTime, pendingJpegOrient, unlockAfter = true)
+                                  } else {
+                                      runAePrecapture()
+                                  }
+                              }
+                          }
+                          STATE_WAITING_PRECAPTURE -> {
+                              val ae = lastAeState
+                              if (ae == null ||
+                                  ae == CaptureResult.CONTROL_AE_STATE_PRECAPTURE ||
+                                  ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                                  ae == CaptureResult.CONTROL_AE_STATE_CONVERGED
+                              ) {
+                                  capState = STATE_WAITING_NON_PRECAPTURE
+                              }
+                          }
+                          STATE_WAITING_NON_PRECAPTURE -> {
+                              val ae = lastAeState
+                              if (ae == null || ae != CaptureResult.CONTROL_AE_STATE_PRECAPTURE) {
+                                  capState = STATE_PREVIEW
+                                  camHandler.removeCallbacks(precaptureTimeout)
+                                  captureStillPicture(pendingShotTime, pendingJpegOrient, unlockAfter = true)
+                              }
+                          }
+                      }
+                  }
+
+                  override fun onCaptureProgressed(s: CameraCaptureSession, r: CaptureRequest, pr: CaptureResult) {
+                      process(pr)
+                  }
+
+                  override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, tr: TotalCaptureResult) {
+                      process(tr)
+                  }
+              }
+
+              private fun startPrecapture(meta: CamMeta, afReady: Boolean, needsFlash: Boolean) {
+                  val cam = cameraDevice ?: return
+                  val session = captureSession ?: return
+                  val surf = previewSurface ?: return
+                  val timeoutMs = if (needsFlash) 900L else 450L
+                  camHandler.removeCallbacks(precaptureTimeout)
+                  camHandler.postDelayed(precaptureTimeout, timeoutMs)
+
+                  try {
+                      if (!afReady && meta.hasAutoFocus) {
+                          capState = STATE_WAITING_LOCK
+                          val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                          b.addTarget(surf)
+                          applyPreviewParams(b, meta)
+                          b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                          session.capture(b.build(), previewCallback, camHandler)
+                      } else {
+                          runAePrecapture()
+                      }
+                  } catch (e: Throwable) {
+                      Log2.e("startPrecapture failed", e)
+                      camHandler.removeCallbacks(precaptureTimeout)
+                      capState = STATE_PREVIEW
+                      captureStillPicture(pendingShotTime, pendingJpegOrient, unlockAfter = false)
+                  }
+              }
+
+              private fun runAePrecapture() {
+                  val cam = cameraDevice ?: return
+                  val session = captureSession ?: return
+                  val surf = previewSurface ?: return
+                  val meta = activeMeta ?: return
+                  try {
+                      capState = STATE_WAITING_PRECAPTURE
+                      val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                      b.addTarget(surf)
+                      applyPreviewParams(b, meta)
+                      b.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+                      session.capture(b.build(), previewCallback, camHandler)
+                  } catch (e: Throwable) {
+                      Log2.e("runAePrecapture failed", e)
+                      camHandler.removeCallbacks(precaptureTimeout)
+                      capState = STATE_PREVIEW
+                      captureStillPicture(pendingShotTime, pendingJpegOrient, unlockAfter = true)
+                  }
+              }
+
+              private fun captureStillPicture(t0: Long, jpegOrient: Int, unlockAfter: Boolean) {
+                  val cam = cameraDevice ?: return
+                  val session = captureSession ?: return
+                  val reader = imageReader ?: return
+                  val meta = activeMeta ?: return
+
+                  try {
+                      val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                      b.addTarget(reader.surface)
+                      applyPreviewParams(b, meta)
+                      b.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_STILL_CAPTURE)
+                      b.set(CaptureRequest.JPEG_ORIENTATION, jpegOrient)
+                      b.set(CaptureRequest.JPEG_QUALITY, 92.toByte())
+                      if (meta.supportsFastEdge) b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
+                      if (meta.supportsFastNr) b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
+
+                      inFlightCaptures.incrementAndGet()
+                      pendingShots.addLast(ShotMeta(t0))
+                      mainHandler.post { listener.onShutterTriggered() }
+
+                      session.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
+                          override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, tr: TotalCaptureResult) {
+                              if (unlockAfter) unlockFocus()
+                          }
+
+                          override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
+                              Log2.e("still capture failed reason=${f.reason}")
+                              if (pendingShots.isNotEmpty()) pendingShots.pollFirst()
+                              inFlightCaptures.decrementAndGet()
+                              if (unlockAfter) unlockFocus()
+                          }
+                      }, camHandler)
+                  } catch (e: Throwable) {
+                      Log2.e("captureStillPicture failed", e)
+                      if (unlockAfter) unlockFocus()
+                  }
+              }
+
+              private fun unlockFocus() {
+                  val cam = cameraDevice ?: return
+                  val session = captureSession ?: return
+                  val surf = previewSurface ?: return
+                  val meta = activeMeta ?: return
+                  try {
+                      val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                      b.addTarget(surf)
+                      applyPreviewParams(b, meta)
+                      b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                      session.capture(b.build(), previewCallback, camHandler)
+                      updatePreviewRepeating()
+                  } catch (_: Throwable) {}
+              }
+
+              private fun onImageAvailable(reader: ImageReader) {
+                  var img: Image? = null
+                  val shot = pendingShots.pollFirst() ?: ShotMeta(SystemClock.elapsedRealtime())
+                  try {
+                      img = reader.acquireNextImage() ?: return
+                      val buf = img.planes[0].buffer
+                      val bytes = ByteArray(buf.remaining())
+                      buf.get(bytes)
+                      val capMs = SystemClock.elapsedRealtime() - shot.t0
+                      Log2.i("jpeg ready ${bytes.size / 1024}KB in ${capMs}ms")
+                      ioExecutor.execute { saveJpegAndThumb(bytes, shot.t0) }
+                  } catch (e: Throwable) {
+                      Log2.e("onImageAvailable failed", e)
+                  } finally {
+                      try { img?.close() } catch (_: Throwable) {}
+                      inFlightCaptures.decrementAndGet()
+                  }
+              }
+
+              private fun saveJpegAndThumb(bytes: ByteArray, t0: Long) {
+                  // 1) Decode lightweight thumbnail for immediate visual confirmation
+                  try {
+                      val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
+                      val raw = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                      if (raw != null) {
+                          val exif = ExifInterface(ByteArrayInputStream(bytes))
+                          val rot = when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                              ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                              ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                              ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                              else -> 0f
+                          }
+                          val thumb = if (rot != 0f) {
+                              val m = Matrix().apply { postRotate(rot) }
+                              Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true).also {
+                                  if (it !== raw) raw.recycle()
+                              }
+                          } else {
+                              raw
+                          }
+                          mainHandler.post { listener.onThumbReady(thumb) }
+                      }
+                  } catch (_: Throwable) {}
+
+                  // 2) Atomic MediaStore write with IS_PENDING
+                  val resolver = appCtx.contentResolver
+                  val name = "IMG_${NAME_FMT.format(LocalDateTime.now())}"
+                  val cv = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                      put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                      put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/FastCam")
+                      put(MediaStore.MediaColumns.IS_PENDING, 1)
+                  }
+                  var uri: Uri? = null
+                  try {
+                      uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return
+                      resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                      val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                      resolver.update(uri, done, null, null)
+                      Log2.i("saved $uri in ${SystemClock.elapsedRealtime() - t0}ms")
+                      val savedUri = uri
+                      mainHandler.post { listener.onPhotoSaved(savedUri) }
+                  } catch (e: Throwable) {
+                      Log2.e("MediaStore save failed", e)
+                      if (uri != null) {
+                          try { resolver.delete(uri, null, null) } catch (_: Throwable) {}
+                      }
+                      mainHandler.post { listener.onError("Save failed") }
+                  }
+              }
+
+              private fun computeJpegOrientation(meta: CamMeta, deviceOrient: Int): Int {
+                  val d = ((deviceOrient + 45) / 90 * 90) % 360
+                  return if (meta.facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                      (meta.sensorOrientation - d + 360) % 360
+                  } else {
+                      (meta.sensorOrientation + d) % 360
+                  }
+              }
+
+              private fun closeSessionInternal() {
+                  camHandler.removeCallbacks(precaptureTimeout)
+                  camHandler.removeCallbacks(resetFocusRunnable)
+                  capState = STATE_PREVIEW
+                  try { captureSession?.close() } catch (_: Throwable) {}
+                  captureSession = null
+                  previewBuilder = null
+              }
+
+              private fun closeCameraInternal() {
+                  closeSessionInternal()
+                  try { cameraDevice?.close() } catch (_: Throwable) {}
+                  cameraDevice = null
+                  try { imageReader?.close() } catch (_: Throwable) {}
+                  imageReader = null
+                  pendingShots.clear()
+                  inFlightCaptures.set(0)
               }
           }
           EOF
@@ -255,91 +1346,116 @@ jobs:
           package com.fastcam
 
           import android.Manifest
-          import android.content.ContentValues
+          import android.app.Activity
+          import android.content.Intent
           import android.content.pm.PackageManager
+          import android.graphics.Bitmap
           import android.graphics.Color
           import android.graphics.drawable.GradientDrawable
+          import android.hardware.camera2.CameraCharacteristics
+          import android.net.Uri
           import android.os.Bundle
-          import android.os.SystemClock
-          import android.provider.MediaStore
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.OrientationEventListener
           import android.view.ScaleGestureDetector
-          import android.view.Surface
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
           import android.view.View
           import android.widget.FrameLayout
+          import android.widget.ImageView
           import android.widget.TextView
           import android.widget.Toast
-          import androidx.activity.ComponentActivity
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.camera.core.Camera
-          import androidx.camera.core.CameraSelector
-          import androidx.camera.core.FocusMeteringAction
-          import androidx.camera.core.ImageCapture
-          import androidx.camera.core.ImageCaptureException
-          import androidx.camera.core.Preview
-          import androidx.camera.lifecycle.ProcessCameraProvider
-          import androidx.camera.view.PreviewView
-          import java.text.SimpleDateFormat
-          import java.util.Date
-          import java.util.Locale
 
-          class MainActivity : ComponentActivity() {
+          class MainActivity : Activity(), CameraEngine.Listener {
 
-              private lateinit var previewView: PreviewView
-              private lateinit var zoomTv: TextView
+              companion object {
+                  private const val REQ_CAMERA = 100
+              }
+
+              private lateinit var engine: CameraEngine
+              private lateinit var surfaceView: SurfaceView
+              private lateinit var flashOverlay: View
               private lateinit var flashTv: TextView
-              private lateinit var orient: OrientationEventListener
-              private var camera: Camera? = null
-              private var imageCapture: ImageCapture? = null
-              private var flashMode = ImageCapture.FLASH_MODE_OFF
-              private var scaled = false
+              private lateinit var zoomTv: TextView
+              private lateinit var switchTv: TextView
+              private lateinit var thumbIv: ImageView
 
-              private val permLauncher =
-                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-                      Log2.i("camera permission granted=$ok")
-                      if (ok) startCamera()
-                      else Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
-                  }
+              private var orient: OrientationEventListener? = null
+              private var activeGen = 0
+              private var cameraStarted = false
+              private var scaled = false
+              private var lastSavedUri: Uri? = null
+              private var lastThumb: Bitmap? = null
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   Log2.i("Activity.onCreate +${Log2.sinceStart()}ms")
-                  buildUi()
 
-                  orient = object : OrientationEventListener(this) {
-                      override fun onOrientationChanged(o: Int) {
-                          if (o == ORIENTATION_UNKNOWN) return
-                          imageCapture?.targetRotation = when (o) {
-                              in 45..134 -> Surface.ROTATION_270
-                              in 135..224 -> Surface.ROTATION_180
-                              in 225..314 -> Surface.ROTATION_90
-                              else -> Surface.ROTATION_0
-                          }
-                      }
+                  engine = CameraEngine(this, this)
+
+                  // Start opening the camera immediately in parallel with UI construction
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                      val dm = resources.displayMetrics
+                      activeGen = engine.start(CameraCharacteristics.LENS_FACING_BACK, dm.widthPixels, dm.heightPixels)
+                      cameraStarted = true
                   }
 
-                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                      startCamera()
-                  } else {
-                      permLauncher.launch(Manifest.permission.CAMERA)
+                  buildUi()
+
+                  if (!cameraStarted) {
+                      requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
                   }
               }
 
               override fun onResume() {
                   super.onResume()
-                  if (orient.canDetectOrientation()) orient.enable()
+                  if (!cameraStarted && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                      val dm = resources.displayMetrics
+                      activeGen = engine.start(engine.currentFacing, dm.widthPixels, dm.heightPixels)
+                      cameraStarted = true
+                      val holder = surfaceView.holder
+                      if (holder.surface != null && holder.surface.isValid) {
+                          engine.onSurfaceReady(activeGen, holder.surface)
+                      }
+                  }
+                  orient?.let { if (it.canDetectOrientation()) it.enable() }
               }
 
               override fun onPause() {
-                  orient.disable()
+                  orient?.disable()
+                  if (cameraStarted) {
+                      engine.stop()
+                      cameraStarted = false
+                  }
+                  Log2.enableDisk(this)
                   super.onPause()
               }
 
               override fun onDestroy() {
                   Log2.i("Activity.onDestroy")
+                  engine.destroy()
+                  lastThumb?.recycle()
+                  lastThumb = null
                   super.onDestroy()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  if (requestCode == REQ_CAMERA) {
+                      val ok = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                      Log2.i("camera permission granted=$ok")
+                      if (ok) {
+                          val dm = resources.displayMetrics
+                          activeGen = engine.start(engine.currentFacing, dm.widthPixels, dm.heightPixels)
+                          cameraStarted = true
+                          val holder = surfaceView.holder
+                          if (holder.surface != null && holder.surface.isValid) {
+                              engine.onSurfaceReady(activeGen, holder.surface)
+                          }
+                      } else {
+                          Toast.makeText(this, "Camera permission required", Toast.LENGTH_LONG).show()
+                      }
+                  }
               }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
@@ -355,40 +1471,110 @@ jobs:
                   val root = FrameLayout(this)
                   root.setBackgroundColor(Color.BLACK)
 
-                  previewView = PreviewView(this).apply {
-                      implementationMode = PreviewView.ImplementationMode.PERFORMANCE
-                      scaleType = PreviewView.ScaleType.FIT_CENTER
+                  surfaceView = SurfaceView(this)
+                  surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+                      override fun surfaceCreated(holder: SurfaceHolder) {
+                          if (cameraStarted) engine.onSurfaceReady(activeGen, holder.surface)
+                      }
+
+                      override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                          if (cameraStarted) engine.onSurfaceReady(activeGen, holder.surface)
+                      }
+
+                      override fun surfaceDestroyed(holder: SurfaceHolder) {
+                          engine.onSurfaceDestroyed()
+                      }
+                  })
+                  root.addView(surfaceView, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+                  // Separate overlay for shutter confirmation flash (never mutates SurfaceView alpha)
+                  flashOverlay = View(this).apply {
+                      setBackgroundColor(Color.WHITE)
+                      alpha = 0f
+                      visibility = View.GONE
                   }
-                  root.addView(previewView, FrameLayout.LayoutParams(-1, -1))
+                  root.addView(flashOverlay, FrameLayout.LayoutParams(-1, -1))
 
                   // Pinch = zoom, tap = focus
                   val sgd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                       override fun onScale(d: ScaleGestureDetector): Boolean {
-                          val cam = camera ?: return true
-                          val z = cam.cameraInfo.zoomState.value ?: return true
                           scaled = true
-                          val r = (z.zoomRatio * d.scaleFactor).coerceIn(z.minZoomRatio, z.maxZoomRatio)
-                          cam.cameraControl.setZoomRatio(r)
+                          engine.scaleZoom(d.scaleFactor)
                           return true
                       }
                   })
-                  previewView.setOnTouchListener { v, e ->
+                  surfaceView.setOnTouchListener { v, e ->
                       if (e.actionMasked == MotionEvent.ACTION_DOWN) scaled = false
                       sgd.onTouchEvent(e)
                       if (e.actionMasked == MotionEvent.ACTION_UP && !scaled) {
-                          focusAt(e.x, e.y)
+                          engine.focusAt(e.x, e.y, v.width, v.height)
                           v.performClick()
                       }
                       true
                   }
 
+                  // Top-left: Flash
+                  flashTv = label(flashLabel(engine.flashMode)).apply {
+                      setOnClickListener {
+                          val next = engine.cycleFlash()
+                          text = flashLabel(next)
+                          Log2.i("flash -> ${flashLabel(next)}")
+                      }
+                  }
+                  root.addView(
+                      flashTv,
+                      FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
+                          leftMargin = dp(12)
+                          topMargin = dp(16)
+                      }
+                  )
+
+                  // Top-right: Zoom
+                  zoomTv = label("1.0x").apply {
+                      setOnClickListener { engine.resetZoom() }
+                  }
+                  root.addView(
+                      zoomTv,
+                      FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+                          rightMargin = dp(12)
+                          topMargin = dp(16)
+                      }
+                  )
+
+                  // Bottom-left: Last captured frame thumbnail
+                  thumbIv = ImageView(this).apply {
+                      scaleType = ImageView.ScaleType.CENTER_CROP
+                      visibility = View.INVISIBLE
+                      background = GradientDrawable().apply {
+                          setColor(0xFF1A1A1A.toInt())
+                          setStroke(dp(2), Color.WHITE)
+                          cornerRadius = dp(6).toFloat()
+                      }
+                      clipToOutline = true
+                      setPadding(dp(2), dp(2), dp(2), dp(2))
+                      setOnClickListener {
+                          val u = lastSavedUri ?: return@setOnClickListener
+                          try {
+                              startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                          } catch (_: Throwable) {}
+                      }
+                  }
+                  root.addView(
+                      thumbIv,
+                      FrameLayout.LayoutParams(dp(56), dp(56), Gravity.BOTTOM or Gravity.START).apply {
+                          leftMargin = dp(24)
+                          bottomMargin = dp(46)
+                      }
+                  )
+
+                  // Bottom-center: Shutter
                   val shutter = View(this).apply {
                       background = GradientDrawable().apply {
                           shape = GradientDrawable.OVAL
                           setColor(Color.WHITE)
                           setStroke(dp(5), 0xFF666666.toInt())
                       }
-                      setOnClickListener { shoot() }
+                      setOnClickListener { engine.takePhoto() }
                   }
                   root.addView(
                       shutter,
@@ -397,118 +1583,114 @@ jobs:
                       }
                   )
 
-                  flashTv = label(flashLabel()).apply { setOnClickListener { cycleFlash() } }
-                  root.addView(
-                      flashTv,
-                      FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
-                          leftMargin = dp(20)
-                          bottomMargin = dp(52)
+                  // Bottom-right: Switch front/back camera (shown after first frame if device has both)
+                  switchTv = label("↻").apply {
+                      textSize = 26f
+                      visibility = View.GONE
+                      setOnClickListener {
+                          activeGen = engine.switchCamera()
+                          val holder = surfaceView.holder
+                          if (holder.surface != null && holder.surface.isValid) {
+                              engine.onSurfaceReady(activeGen, holder.surface)
+                          }
                       }
-                  )
-
-                  zoomTv = label("1.0x").apply {
-                      setOnClickListener { camera?.cameraControl?.setZoomRatio(1f) }
                   }
                   root.addView(
-                      zoomTv,
+                      switchTv,
                       FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
-                          rightMargin = dp(20)
-                          bottomMargin = dp(52)
+                          rightMargin = dp(24)
+                          bottomMargin = dp(46)
                       }
                   )
 
                   setContentView(root)
               }
 
-              private fun startCamera() {
-                  val fut = ProcessCameraProvider.getInstance(this)
-                  fut.addListener({
-                      try {
-                          val provider = fut.get()
-                          val preview = Preview.Builder().build()
-                          preview.setSurfaceProvider(previewView.surfaceProvider)
-                          val ic = ImageCapture.Builder()
-                              .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                              .setFlashMode(flashMode)
-                              .build()
-
-                          provider.unbindAll()
-                          val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, ic)
-                          camera = cam
-                          imageCapture = ic
-
-                          if (!cam.cameraInfo.hasFlashUnit()) {
-                              flashTv.alpha = 0.3f
-                              flashTv.isEnabled = false
-                          }
-                          cam.cameraInfo.zoomState.observe(this) {
-                              zoomTv.text = String.format(Locale.US, "%.1fx", it.zoomRatio)
-                          }
-                          previewView.previewStreamState.observe(this) { s ->
-                              if (s == PreviewView.StreamState.STREAMING) {
-                                  Log2.i("first frame +${Log2.sinceStart()}ms since process start")
-                              }
-                          }
-                          Log2.i("camera bound +${Log2.sinceStart()}ms flashUnit=${cam.cameraInfo.hasFlashUnit()}")
-                      } catch (e: Exception) {
-                          Log2.e("camera bind failed", e)
-                      }
-                  }, mainExecutor)
-              }
-
-              private fun focusAt(x: Float, y: Float) {
-                  val cam = camera ?: return
-                  val p = previewView.meteringPointFactory.createPoint(x, y)
-                  cam.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(p).build())
-              }
-
-              private fun flashLabel() = when (flashMode) {
-                  ImageCapture.FLASH_MODE_ON -> "⚡ ON"
-                  ImageCapture.FLASH_MODE_AUTO -> "⚡ AUTO"
+              private fun flashLabel(mode: Int) = when (mode) {
+                  CameraEngine.FLASH_ON -> "⚡ ON"
+                  CameraEngine.FLASH_AUTO -> "⚡ AUTO"
                   else -> "⚡ OFF"
               }
 
-              private fun cycleFlash() {
-                  flashMode = when (flashMode) {
-                      ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
-                      ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
-                      else -> ImageCapture.FLASH_MODE_OFF
+              // ---- CameraEngine.Listener ----
+
+              override fun onPreviewSizeReady(gen: Int, width: Int, height: Int, sensorOrientation: Int) {
+                  if (gen != activeGen) return
+                  surfaceView.holder.setFixedSize(width, height)
+
+                  val dm = resources.displayMetrics
+                  val screenW = dm.widthPixels
+                  val screenH = dm.heightPixels
+                  val rotated = sensorOrientation == 90 || sensorOrientation == 270
+                  val bufW = if (rotated) height else width
+                  val bufH = if (rotated) width else height
+
+                  val scale = minOf(screenW.toFloat() / bufW, screenH.toFloat() / bufH)
+                  val targetW = (bufW * scale + 0.5f).toInt()
+                  val targetH = (bufH * scale + 0.5f).toInt()
+
+                  val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
+                  if (lp.width != targetW || lp.height != targetH) {
+                      lp.width = targetW
+                      lp.height = targetH
+                      surfaceView.layoutParams = lp
                   }
-                  imageCapture?.flashMode = flashMode
-                  flashTv.text = flashLabel()
-                  Log2.i("flash -> ${flashLabel()}")
               }
 
-              private fun shoot() {
-                  val ic = imageCapture ?: return
-                  val name = "IMG_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-                  val cv = ContentValues().apply {
-                      put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                      put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                      put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/FastCam")
+              override fun onCameraReady(facing: Int, hasFlash: Boolean, minZoom: Float, maxZoom: Float) {
+                  flashTv.isEnabled = hasFlash
+                  flashTv.alpha = if (hasFlash) 1f else 0.3f
+                  zoomTv.text = "1.0x"
+              }
+
+              override fun onSwitchAvailability(canSwitch: Boolean) {
+                  switchTv.visibility = if (canSwitch) View.VISIBLE else View.GONE
+              }
+
+              override fun onFirstFrame() {
+                  // Deferred strictly until after the first preview frame is on screen
+                  Log2.enableDisk(this)
+                  if (orient == null) {
+                      orient = object : OrientationEventListener(this) {
+                          override fun onOrientationChanged(o: Int) {
+                              if (o != ORIENTATION_UNKNOWN) engine.setDeviceOrientation(o)
+                          }
+                      }.apply {
+                          if (canDetectOrientation()) enable()
+                      }
                   }
-                  val opts = ImageCapture.OutputFileOptions
-                      .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
-                      .build()
+              }
 
-                  val zoom = camera?.cameraInfo?.zoomState?.value?.zoomRatio
-                  Log2.i("capture requested name=$name flash=${flashLabel()} zoom=$zoom")
-                  val t0 = SystemClock.elapsedRealtime()
+              override fun onShutterTriggered() {
+                  flashOverlay.animate().cancel()
+                  flashOverlay.visibility = View.VISIBLE
+                  flashOverlay.alpha = 0.7f
+                  flashOverlay.animate()
+                      .alpha(0f)
+                      .setDuration(75L)
+                      .withEndAction { flashOverlay.visibility = View.GONE }
+                      .start()
+              }
 
-                  previewView.animate().alpha(0.4f).setDuration(40).withEndAction {
-                      previewView.animate().alpha(1f).setDuration(80).start()
-                  }.start()
+              override fun onZoomChanged(zoom: Float) {
+                  val z10 = (zoom * 10f + 0.5f).toInt()
+                  zoomTv.text = "${z10 / 10}.${z10 % 10}x"
+              }
 
-                  ic.takePicture(opts, mainExecutor, object : ImageCapture.OnImageSavedCallback {
-                      override fun onImageSaved(r: ImageCapture.OutputFileResults) {
-                          Log2.i("saved ${r.savedUri} in ${SystemClock.elapsedRealtime() - t0}ms")
-                      }
+              override fun onThumbReady(bitmap: Bitmap) {
+                  val prev = lastThumb
+                  lastThumb = bitmap
+                  thumbIv.setImageBitmap(bitmap)
+                  thumbIv.visibility = View.VISIBLE
+                  if (prev != null && prev !== bitmap) prev.recycle()
+              }
 
-                      override fun onError(e: ImageCaptureException) {
-                          Log2.e("capture failed code=${e.imageCaptureError}", e)
-                          Toast.makeText(this@MainActivity, "Capture failed", Toast.LENGTH_SHORT).show()
-                      }
-                  })
+              override fun onPhotoSaved(uri: Uri) {
+                  lastSavedUri = uri
+              }
+
+              override fun onError(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
               }
           }
           EOF
